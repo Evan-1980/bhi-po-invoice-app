@@ -4,10 +4,10 @@ import pandas as pd
 import io
 import hashlib
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 
-st.set_page_config(page_title="BHI PO → Invoices → Items (v7)", page_icon="📑", layout="wide")
+st.set_page_config(page_title="BHI PO → Invoices → Items (v8)", page_icon="📑", layout="wide")
 
 # ===================== Optional simple auth (safe) =====================
 _APP_PASSWORD = None
@@ -20,6 +20,21 @@ if _APP_PASSWORD:
     pw = st.text_input("Enter access password", type="password")
     if pw != _APP_PASSWORD:
         st.stop()
+
+# ===================== Sticky KPI + chip styles =====================
+st.markdown(
+    """
+    <style>
+      .kpi-row { position: sticky; top: 0; z-index: 5; background: var(--background-color); padding-top: .5rem; padding-bottom: .5rem; }
+      .status-chip { padding: 2px 8px; border-radius: 999px; font-weight: 600; font-size: 0.85rem; display: inline-block; }
+      .chip-open { background:#eef2ff; color:#3730a3; }
+      .chip-partial { background:#fff7ed; color:#9a3412; }
+      .chip-closed { background:#ecfdf5; color:#065f46; }
+      .chip-over { background:#fef2f2; color:#991b1b; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ===================== Helpers =====================
 def _num_series(s: pd.Series) -> pd.Series:
@@ -88,6 +103,7 @@ def get_dfs(uploaded):
         st.error("No file uploaded and `BHI.xlsx` not found alongside the app.")
         st.stop()
 
+# Polished Excel writer with autosizing and freeze header; engine fallback
 def build_po_pack_excel(po_num: str, inv_df: pd.DataFrame, items_df: pd.DataFrame) -> BytesIO:
     buf = BytesIO()
     try:
@@ -126,13 +142,34 @@ def build_po_pack_excel(po_num: str, inv_df: pd.DataFrame, items_df: pd.DataFram
     buf.seek(0)
     return buf
 
+def status_with_tol(po_val, inv_val, tol_val):
+    po_val = po_val or 0.0
+    inv_val = inv_val or 0.0
+    if abs(po_val - inv_val) <= tol_val:
+        return "CLOSED"
+    if inv_val == 0:
+        return "OPEN"
+    if 0 < inv_val < po_val:
+        return "PARTIAL"
+    if inv_val > po_val:
+        return "OVER-INVOICED"
+    return "OPEN"
+
+def status_chip_text(s: str) -> str:
+    s = (s or "").upper()
+    if s == "CLOSED":  return '<span class="status-chip chip-closed">CLOSED</span>'
+    if s == "PARTIAL": return '<span class="status-chip chip-partial">PARTIAL</span>'
+    if s == "OVER-INVOICED": return '<span class="status-chip chip-over">OVER</span>'
+    return '<span class="status-chip chip-open">OPEN</span>'
+
 # ===================== UI: File =====================
-st.title("📑 PO → Invoices → Items (v7)")
-st.caption("Search a PO, view its invoices, drill into items, export Excel/CSV, quality checks, and management rollups.")
+st.title("📑 PO → Invoices → Items (v8)")
+st.caption("Search PO, view invoices, items, exports, quality checks, suggestions, and management rollups.")
 
 uploaded = st.file_uploader("Upload a .xlsx (optional). If omitted, the app will load BHI.xlsx from the app folder.", type=["xlsx"])
 dfs = get_dfs(uploaded)
 
+# Identify sheets
 sheet_pos = "POs" if "POs" in dfs else (list(dfs.keys())[0] if dfs else None)
 sheet_inv = "Invoices" if "Invoices" in dfs else (list(dfs.keys())[1] if len(dfs) > 1 else sheet_pos)
 sheet_items = "InvoiceItems" if "InvoiceItems" in dfs else None
@@ -147,10 +184,9 @@ for df in (POs, Invoices, InvoiceItems):
             if pd.api.types.is_object_dtype(df[col]):
                 df[col] = df[col].astype(str).str.strip()
 
-# ===================== Sidebar: Settings =====================
+# Sidebar: settings
 st.sidebar.header("Settings")
-tol = st.sidebar.number_input("Close tolerance (amount)", value=0.01, step=0.01, help="Treat |PO - Invoiced| ≤ tolerance as CLOSED")
-
+tol = st.sidebar.number_input("Close tolerance (amount)", value=0.01, step=0.01)
 st.sidebar.subheader("Currency normalization")
 base_ccy = st.sidebar.text_input("Base currency", value="USD")
 rates_raw = st.sidebar.text_area("Rates (one per line, e.g. 'IQD=0.00076')", value="IQD=0.00076\nEUR=1.09")
@@ -162,15 +198,13 @@ for line in rates_raw.splitlines():
             rates[k.strip().upper()] = float(v)
         except Exception:
             pass
-
 def normalize_amount(amount_series: pd.Series, ccy_series: pd.Series) -> pd.Series:
     a = _num_series(amount_series)
     fx = ccy_series.astype(str).str.upper().map(rates).fillna(1.0)
     return a * fx
-
 show_quality = st.sidebar.checkbox("Show Data Quality tab", value=True)
 
-# ===================== Required columns check (soft) =====================
+# Required columns check (soft)
 REQUIRED = {
     "POs": ["PO_NUMBER", "PO_AMOUNT"],
     "Invoices": ["INVOICE_NUMBER", "PO_NUMBER", "INVOICE_AMOUNT"],
@@ -180,26 +214,23 @@ def warn_required(name, df):
     need = [c for c in REQUIRED[name] if c not in df.columns]
     if need:
         st.warning(f"'{name}' missing likely columns: {', '.join(need)}")
-
-warn_required("POs", POs)
-warn_required("Invoices", Invoices)
+for name, df in (("POs", POs), ("Invoices", Invoices)):
+    warn_required(name, df)
 if not InvoiceItems.empty:
     warn_required("InvoiceItems", InvoiceItems)
 
-# ===================== PO search & deep link =====================
+# PO search & deep link
 qp = get_query_params()
 default_po = None
-if isinstance(qp, dict):
-    if "po" in qp:
-        default_po = qp["po"] if isinstance(qp["po"], str) else (qp["po"][0] if qp["po"] else None)
+if isinstance(qp, dict) and "po" in qp:
+    default_po = qp["po"] if isinstance(qp["po"], str) else (qp["po"][0] if qp["po"] else None)
 
 left, right = st.columns([2, 3])
 with left:
     po_query = st.text_input("Find PO (partial or full)", value=default_po or "", placeholder="e.g., 9460").strip()
 
 if "PO_NUMBER" not in POs.columns or POs.empty:
-    st.error("POs sheet is missing or has no 'PO_NUMBER'.")
-    st.stop()
+    st.error("POs sheet is missing or has no 'PO_NUMBER'."); st.stop()
 
 po_list = POs["PO_NUMBER"].dropna().astype(str).unique().tolist()
 matches = [p for p in po_list if po_query.lower() in p.lower()] if po_query else po_list
@@ -212,27 +243,15 @@ if not picked_po:
     st.info("Type to search or pick a PO.")
     st.stop()
 
-# ===================== Invoices for selected PO =====================
+# Invoices for selected PO
 if "PO_NUMBER" not in Invoices.columns:
     st.error("Invoices sheet missing 'PO_NUMBER'."); st.stop()
-
 inv_for_po = Invoices[Invoices["PO_NUMBER"].astype(str) == str(picked_po)].copy()
 
-# Quick filter & column chooser
-st.subheader("Invoices for this PO")
-inv_quick = st.text_input("Filter invoices (contains, any column)", key="inv_filter").lower().strip()
-if inv_quick:
-    inv_for_po = inv_for_po[inv_for_po.apply(lambda r: r.astype(str).str.lower().str.contains(inv_quick, na=False)).any(axis=1)]
-
-inv_cols_available = list(inv_for_po.columns)
-default_inv_cols = [c for c in ["INVOICE_NUMBER","INVOICE_DATE","INVOICE_AMOUNT","CURRENCY","STATUS","PO_NUMBER"] if c in inv_for_po.columns]
-pick_cols_inv = st.multiselect("Columns to show", inv_cols_available, default=default_inv_cols, key="inv_cols_show")
-
-# Totals
+# KPIs (sticky)
 amt_ser = _num_series(inv_for_po["INVOICE_AMOUNT"]) if "INVOICE_AMOUNT" in inv_for_po.columns else pd.Series(dtype="float64")
 total_invoiced = float(amt_ser.sum()) if not amt_ser.empty else 0.0
 
-# Normalized totals
 total_invoiced_norm = None
 if {"INVOICE_AMOUNT","CURRENCY"}.issubset(inv_for_po.columns):
     total_invoiced_norm = float(normalize_amount(inv_for_po["INVOICE_AMOUNT"], inv_for_po["CURRENCY"]).sum())
@@ -243,41 +262,50 @@ if {"PO_NUMBER","PO_AMOUNT"}.issubset(POs.columns):
     if not r.empty:
         po_amount = float(_num_series(pd.Series([r.iloc[0]["PO_AMOUNT"]])).fillna(0).iloc[0])
 
-# KPIs
+st.markdown('<div class="kpi-row">', unsafe_allow_html=True)
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Invoiced (this PO)", f"{total_invoiced:,.0f}")
+k1.metric("Invoiced", f"{total_invoiced:,.0f}")
 if total_invoiced_norm is not None:
     k2.metric(f"Invoiced → {base_ccy}", f"{total_invoiced_norm:,.0f}")
 if po_amount is not None:
     k3.metric("PO Amount", f"{po_amount:,.0f}")
     k4.metric("Variance", f"{(po_amount - total_invoiced):,.0f}")
-
-def status_with_tol(po_val, inv_val, tol_val):
-    po_val = po_val or 0.0
-    inv_val = inv_val or 0.0
-    if abs(po_val - inv_val) <= tol_val:
-        return "CLOSED"
-    if inv_val == 0:
-        return "OPEN"
-    if 0 < inv_val < po_val:
-        return "PARTIAL"
-    if inv_val > po_val:
-        return "OVER-INVOICED"
-    return "OPEN"
+st.markdown('</div>', unsafe_allow_html=True)
 
 if po_amount is not None:
-    st.caption(f"Status (tol={tol}): **{status_with_tol(po_amount, total_invoiced, tol)}**")
+    st.caption(f"Status (tol={tol}): {status_chip_text(status_with_tol(po_amount, total_invoiced, tol))}", unsafe_allow_html=True)
 
 # Tabs
-tabs = ["Invoices", "Items", "Rollups", "Quality"] if show_quality else ["Invoices", "Items", "Rollups"]
-tab_inv, tab_items, tab_rollups, *rest = st.tabs(tabs)
+tabs = ["Invoices", "Items", "Rollups", "Suggest", "Quality"] if show_quality else ["Invoices", "Items", "Rollups", "Suggest"]
+tab_inv, tab_items, tab_rollups, tab_suggest, *rest = st.tabs(tabs)
 tab_quality = rest[0] if rest else None
 
+# ===== Invoices Tab =====
 with tab_inv:
-    view_df = inv_for_po[pick_cols_inv] if pick_cols_inv else inv_for_po
-    paged = paginate(view_df, key="inv", per_page=100)
-    st.dataframe(paged, use_container_width=True)
+    st.subheader("Invoices for this PO")
+    inv_quick = st.text_input("Filter invoices (contains, any column)", key="inv_filter").lower().strip()
+    if inv_quick:
+        inv_for_po = inv_for_po[inv_for_po.apply(lambda r: r.astype(str).str.lower().str.contains(inv_quick, na=False)).any(axis=1)]
 
+    # Colored status chip column
+    if po_amount is not None:
+        # Compute per-invoice status vs PO share (coarse): not exact allocation, but gives visibility
+        inv_for_po["_amt"] = _num_series(inv_for_po.get("INVOICE_AMOUNT", pd.Series(dtype=str)))
+        inv_for_po["_chip"] = inv_for_po["_amt"].apply(lambda x: status_chip_text("PARTIAL" if 0 < (x or 0) < (po_amount or 0) else ("OVER-INVOICED" if (x or 0) > (po_amount or 0) else ("CLOSED" if abs((po_amount or 0)-(x or 0))<=tol else "OPEN"))))
+    else:
+        inv_for_po["_chip"] = status_chip_text("OPEN")
+
+    inv_cols_available = [c for c in inv_for_po.columns if not c.startswith("_")]
+    default_inv_cols = [c for c in ["INVOICE_NUMBER","INVOICE_DATE","INVOICE_AMOUNT","CURRENCY","STATUS","PO_NUMBER"] if c in inv_cols_available]
+    pick_cols_inv = st.multiselect("Columns to show", inv_cols_available, default=default_inv_cols, key="inv_cols_show")
+
+    # Show with chips
+    show_df = inv_for_po[[c for c in pick_cols_inv if c in inv_for_po.columns]].copy() if pick_cols_inv else inv_for_po.drop(columns=[c for c in inv_for_po.columns if c.startswith("_")], errors="ignore").copy()
+    show_df.insert(0, "STATUS_CHIP", inv_for_po["_chip"])
+    paged = paginate(show_df, key="inv", per_page=100)
+    st.write(paged.to_html(escape=False, index=False), unsafe_allow_html=True)
+
+    # Invoice totals summary
     if "INVOICE_NUMBER" in inv_for_po.columns:
         summary = (inv_for_po.assign(_amt=_num_series(inv_for_po.get("INVOICE_AMOUNT", pd.Series(dtype=str))))
                    .groupby("INVOICE_NUMBER", dropna=True)["_amt"].sum().reset_index()
@@ -285,13 +313,18 @@ with tab_inv:
         st.markdown("**Invoice totals**")
         st.dataframe(summary, use_container_width=True)
 
+    # Exports
     inv_nums = inv_for_po["INVOICE_NUMBER"].dropna().astype(str).unique().tolist() if "INVOICE_NUMBER" in inv_for_po.columns else []
     po_items_full = InvoiceItems[InvoiceItems["INVOICE_NUMBER"].astype(str).isin(inv_nums)].copy() if (not InvoiceItems.empty and "INVOICE_NUMBER" in InvoiceItems.columns) else pd.DataFrame()
     xbuf = build_po_pack_excel(str(picked_po), inv_for_po, po_items_full)
     st.download_button("⬇️ Download PO Pack (Excel)", data=xbuf, file_name=f"{picked_po}_pack.xlsx")
+    st.download_button("⬇️ Export current invoices (JSON)", data=inv_for_po.to_json(orient="records").encode("utf-8"), file_name=f"invoices_{picked_po}.json", mime="application/json")
 
+# ===== Items Tab =====
 with tab_items:
     st.subheader("Items")
+    inv_nums = inv_for_po["INVOICE_NUMBER"].dropna().astype(str).unique().tolist() if "INVOICE_NUMBER" in inv_for_po.columns else []
+    po_items_full = InvoiceItems[InvoiceItems["INVOICE_NUMBER"].astype(str).isin(inv_nums)].copy() if (not InvoiceItems.empty and "INVOICE_NUMBER" in InvoiceItems.columns) else pd.DataFrame()
     show_all_items = st.checkbox("Show all items for this PO", value=True)
     if show_all_items:
         items_pref = ["INVOICE_NUMBER","LINE","MATERIAL","DESCRIPTION","QTY","UNIT","UNIT_PRICE","LINE_TOTAL"]
@@ -326,23 +359,42 @@ with tab_items:
                     mime="text/csv"
                 )
 
+# ===== Rollups Tab =====
 with tab_rollups:
     st.subheader("Management rollups")
+
+    # Optional DuckDB acceleration
+    duck_ok = False
+    try:
+        import duckdb as dd  # type: ignore
+        duck_ok = True
+    except Exception:
+        duck_ok = False
+
+    # Vendor summary
     if "VENDOR" in inv_for_po.columns:
-        vend = (inv_for_po.assign(_amt=_num_series(inv_for_po.get("INVOICE_AMOUNT", pd.Series(dtype=str))))
-                .groupby("VENDOR", dropna=True)["_amt"].sum().reset_index()
-                .rename(columns={"_amt": "Total Amount"}).sort_values("Total Amount", ascending=False))
+        if duck_ok:
+            tmp = inv_for_po.assign(_amt=_num_series(inv_for_po.get("INVOICE_AMOUNT", pd.Series(dtype=str))))
+            vend = dd.query("SELECT VENDOR, SUM(_amt) AS TotalAmount FROM tmp GROUP BY 1 ORDER BY 2 DESC").to_df()
+        else:
+            vend = (inv_for_po.assign(_amt=_num_series(inv_for_po.get("INVOICE_AMOUNT", pd.Series(dtype=str))))
+                    .groupby("VENDOR", dropna=True)["_amt"].sum().reset_index()
+                    .rename(columns={"_amt": "TotalAmount"}).sort_values("TotalAmount", ascending=False))
         st.markdown("**Vendor summary**")
         st.dataframe(vend, use_container_width=True)
     else:
         st.info("No VENDOR column in Invoices for vendor rollup.")
 
+    # Monthly summary
     if "INVOICE_DATE" in inv_for_po.columns:
         tmp = inv_for_po.copy()
-        tmp["__month"] = pd.to_datetime(tmp["INVOICE_DATE"], errors="coerce").dt.to_period("M").astype(str)
-        monthly = (tmp.assign(_amt=_num_series(tmp.get("INVOICE_AMOUNT", pd.Series(dtype=str))))
-                    .groupby("__month")["_amt"].sum().reset_index()
-                    .rename(columns={"__month": "Month", "_amt": "Amount"}))
+        tmp["_d"] = pd.to_datetime(tmp["INVOICE_DATE"], errors="coerce")
+        tmp["_amt"] = _num_series(tmp.get("INVOICE_AMOUNT", pd.Series(dtype=str)))
+        if duck_ok:
+            monthly = dd.query("SELECT strftime(_d, '%Y-%m') AS Month, SUM(_amt) AS Amount FROM tmp GROUP BY 1 ORDER BY 1").to_df()
+        else:
+            tmp["Month"] = tmp["_d"].dt.to_period("M").astype(str)
+            monthly = tmp.groupby("Month")["_amt"].sum().reset_index().rename(columns={"_amt":"Amount"})
         st.markdown("**Monthly invoiced**")
         if not monthly.empty:
             st.bar_chart(monthly.set_index("Month")["Amount"])
@@ -352,19 +404,7 @@ with tab_rollups:
     else:
         st.info("No INVOICE_DATE column for monthly summary.")
 
-    def status_with_tol(po_val, inv_val, tol_val):
-        po_val = po_val or 0.0
-        inv_val = inv_val or 0.0
-        if abs(po_val - inv_val) <= tol_val:
-            return "CLOSED"
-        if inv_val == 0:
-            return "OPEN"
-        if 0 < inv_val < po_val:
-            return "PARTIAL"
-        if inv_val > po_val:
-            return "OVER-INVOICED"
-        return "OPEN"
-
+    # PO status report (all POs)
     def po_status_row(po_num):
         inv = Invoices[Invoices["PO_NUMBER"].astype(str) == str(po_num)]
         total = _num_series(inv.get("INVOICE_AMOUNT", pd.Series(dtype=str))).sum()
@@ -384,7 +424,59 @@ with tab_rollups:
                            data=report.to_csv(index=False).encode("utf-8-sig"),
                            file_name="po_status.csv", mime="text/csv")
 
-# ===================== Data Quality =====================
+# ===== Suggest Tab (PO suggestions + 3-way variance) =====
+with tab_suggest:
+    st.subheader("Suggestions & Controls")
+
+    # 3-way check: Invoice vs Items
+    if {"INVOICE_NUMBER"}.issubset(Invoices.columns) and not InvoiceItems.empty:
+        items_sum = (InvoiceItems.assign(_line=_num_series(InvoiceItems.get("LINE_TOTAL", pd.Series(dtype=str)))) \
+                     .groupby("INVOICE_NUMBER")["_line"].sum().rename("ITEMS_TOTAL"))
+        inv_sum   = _num_series(Invoices.get("INVOICE_AMOUNT", pd.Series(dtype=str)))
+        chk = Invoices.assign(INV_TOTAL=inv_sum).join(items_sum, on="INVOICE_NUMBER")
+        chk["INV_vs_ITEMS"] = chk["INV_TOTAL"] - chk["ITEMS_TOTAL"]
+        st.markdown("### 3-way check (Invoice vs Items)")
+        st.dataframe(chk[["INVOICE_NUMBER","INV_TOTAL","ITEMS_TOTAL","INV_vs_ITEMS"]].sort_values("INV_vs_ITEMS", key=lambda s: s.abs()), use_container_width=True)
+        st.download_button("⬇️ Download 3-way check (CSV)",
+                           data=chk.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="three_way_check.csv", mime="text/csv")
+    else:
+        st.info("Need Invoices + InvoiceItems (with LINE_TOTAL) for 3-way check.")
+
+    # PO suggestions for invoices missing PO
+    def suggest_po_for_invoice(inv_row, POs, days=7, pct=0.02):
+        amt = _num_series(pd.Series([inv_row.get("INVOICE_AMOUNT")])).iloc[0]
+        vdr = str(inv_row.get("VENDOR", "")).strip().lower()
+        d   = pd.to_datetime(inv_row.get("INVOICE_DATE"), errors="coerce")
+        pool = POs.copy()
+        if "VENDOR" in pool.columns and vdr:
+            pool = pool[pool["VENDOR"].astype(str).str.lower().str.strip() == vdr]
+        if "PO_DATE" in pool.columns and pd.notna(d):
+            pool["_po_d"] = pd.to_datetime(pool["PO_DATE"], errors="coerce")
+            pool = pool[pool["_po_d"].between(d - pd.Timedelta(days, "D"), d + pd.Timedelta(days, "D"))]
+        if "PO_AMOUNT" in pool.columns and pd.notna(amt):
+            pa = _num_series(pool["PO_AMOUNT"])
+            pool = pool[(pa.between(amt*(1-pct), amt*(1+pct)))]
+        return pool.head(3)
+
+    if "PO_NUMBER" in Invoices.columns:
+        need_link = Invoices[Invoices["PO_NUMBER"].isna()].copy()
+        if not need_link.empty:
+            st.markdown("### Suggested POs for invoices missing PO")
+            sample = need_link.head(20).copy()
+            def top_candidates(row):
+                cands = suggest_po_for_invoice(row, POs)
+                return ",".join(cands["PO_NUMBER"].astype(str)) if not cands.empty else ""
+            sample["SUGGESTED_POs"] = sample.apply(top_candidates, axis=1)
+            cols = [c for c in ["INVOICE_NUMBER","VENDOR","INVOICE_DATE","INVOICE_AMOUNT","SUGGESTED_POs"] if c in sample.columns or c=="SUGGESTED_POs"]
+            st.dataframe(sample[cols], use_container_width=True)
+            st.download_button("⬇️ Download suggestions (CSV)",
+                               data=sample[cols].to_csv(index=False).encode("utf-8-sig"),
+                               file_name="po_suggestions.csv", mime="text/csv")
+        else:
+            st.success("No invoices missing PO_NUMBER 🎉")
+
+# ===== Quality Tab =====
 if show_quality and tab_quality is not None:
     with tab_quality:
         st.subheader("Data Quality")
@@ -442,5 +534,24 @@ if show_quality and tab_quality is not None:
                 mime="text/csv"
             )
 
+# ===== Audit log (simple) =====
+if "audit_log" not in st.session_state:
+    st.session_state["audit_log"] = []
+
+def log(event: str, detail: str = ""):
+    st.session_state["audit_log"].append({
+        "ts": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "event": event,
+        "detail": detail,
+        "po": picked_po
+    })
+
+# Log key actions
+log("open_po", f"Opened PO {picked_po}")
+if st.button("⬇️ Download audit log (CSV)"):
+    audit_df = pd.DataFrame(st.session_state["audit_log"])
+    st.download_button("Download audit.csv", data=audit_df.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="audit.csv", mime="text/csv", key="audit_dl_btn")
+
 # Footer
-st.caption(f"Built {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} • v7")
+st.caption(f"Built {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} • v8")
