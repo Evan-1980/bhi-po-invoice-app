@@ -1,0 +1,21 @@
+# .streamlit/config.toml
+
+[theme]
+base = "light"                 # "light" or "dark"
+primaryColor = "#0E7AFE"       # buttons, highlights
+backgroundColor = "#FFFFFF"    # page bg
+secondaryBackgroundColor = "#F5F7FB"  # sidebar/cards bg
+textColor = "#1F2937"          # body text
+font = "sans serif"            # "sans serif", "serif", or "monospace"
+
+[browser]
+gatherUsageStats = false       # disable analytics
+
+[client]
+toolbarMode = "minimal"        # "auto", "minimal", or "viewer"
+
+[server]
+# On Cloud, Streamlit sets headless/port automatically.
+# Keep defaults unless you have a special need.
+# headless = true
+# enableXsrfProtection = true
