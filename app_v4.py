@@ -23,6 +23,16 @@ if _APP_PASSWORD:
     if pw != _APP_PASSWORD:
         st.stop()
 
+from pathlib import Path
+
+# Sidebar branding
+logo_path = Path("assets/logo.png") if Path("assets/logo.png").exists() else Path("logo.png")
+with st.sidebar:
+    if logo_path.exists():
+        st.image(str(logo_path), caption=None, use_container_width=True)
+    st.markdown("### BHI Dashboard")
+    st.caption("PO → Invoices → Items")
+
 # ===================== Helpers =====================
 def _num_series(s: pd.Series) -> pd.Series:
     """Coerce mixed currency-like strings to float (best-effort)."""
