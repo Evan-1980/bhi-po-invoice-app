@@ -297,7 +297,10 @@ with left:
 po_list = POs["PO_NUMBER"].dropna().astype(str).unique().tolist()
 matches = [p for p in po_list if po_query.lower() in p.lower()] if po_query else po_list
 matches = matches[:500]
-default_index = 0 if default_po and default_po in matches else (0 if matches else None)
+if not matches:
+    st.warning("No POs match that search. Try a different query.")
+    st.stop()
+default_index = 0 if default_po and default_po in matches else 0
 picked_po = st.selectbox("Select PO", options=matches, index=default_index)
 set_query_params(po=picked_po)
 
